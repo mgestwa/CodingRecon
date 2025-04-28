@@ -1,0 +1,314 @@
+# --- START OF FILE app.py ---
+
+import os
+import fastf1
+import pandas as pd
+import numpy as np
+from sklearn.model_selection import train_test_split
+from sklearn.ensemble import GradientBoostingRegressor
+from sklearn.metrics import mean_absolute_error
+import matplotlib.pyplot as plt
+import seaborn as sns
+
+# --- Configuration ---
+# Ustawienia cache, sesji i parametrów modelu
+CACHE_DIR = './fastf1_cache'
+
+TARGET_YEAR = 2023
+TARGET_GP = 'Australia'
+TARGET_SESSION_TYPE = 'R'
+
+SOURCE_YEAR = 2024
+SOURCE_GP = 'Australia'
+SOURCE_SESSION_TYPE = 'Q'
+
+TEST_SPLIT_SIZE = 0.2
+RANDOM_STATE_SPLIT = 42
+RANDOM_STATE_MODEL = 39
+N_ESTIMATORS = 100
+LEARNING_RATE = 0.1
+
+FEATURE_COL_NAME = 'SourceSessionTime(s)' # Użyjemy bardziej generycznej nazwy
+TARGET_COL_NAME = 'TargetRaceLapTime(s)'
+
+# --- Helper Functions ---
+
+def time_to_seconds(lap_time: pd.Timedelta | float | None) -> float | None:
+    """Konwertuje obiekt czasu okrążenia (Timedelta) na sekundy."""
+    if pd.isna(lap_time):
+        return np.nan
+    if isinstance(lap_time, pd.Timedelta):
+        return lap_time.total_seconds()
+    if isinstance(lap_time, (int, float)): # Na wypadek, gdyby już był liczbą
+        return float(lap_time)
+    return np.nan
+
+def get_fastest_lap_per_driver(laps_data: pd.DataFrame | None, time_col_name: str) -> pd.DataFrame:
+    """Znajduje najszybsze okrążenie dla każdego kierowcy używając groupby."""
+    if laps_data is None or laps_data.empty:
+        print("  Ostrzeżenie [get_fastest]: Wejściowe dane okrążeń są puste.")
+        # Zwróć pusty DataFrame z oczekiwanymi kolumnami i indeksem
+        return pd.DataFrame(columns=[time_col_name], index=pd.Index([], name='Driver'))
+
+    required_cols = ['Driver', 'LapTime']
+    if not all(col in laps_data.columns for col in required_cols):
+        print(f"  BŁĄD [get_fastest]: Brak wymaganych kolumn ({required_cols}).")
+        print(f"  Dostępne kolumny: {laps_data.columns.tolist()}")
+        return pd.DataFrame(columns=[time_col_name], index=pd.Index([], name='Driver'))
+
+    try:
+        # Pracuj na kopii, aby uniknąć SettingWithCopyWarning
+        laps_copy = laps_data.copy()
+        laps_copy['LapTime(s)'] = laps_copy['LapTime'].apply(time_to_seconds)
+        laps_cleaned = laps_copy.dropna(subset=['LapTime(s)', 'Driver'])
+
+        if laps_cleaned.empty:
+             print("  Ostrzeżenie [get_fastest]: Brak ważnych okrążeń po czyszczeniu NaN.")
+             return pd.DataFrame(columns=[time_col_name], index=pd.Index([], name='Driver'))
+
+        # Znajdź indeksy najszybszych okrążeń
+        fastest_indices = laps_cleaned.groupby('Driver')['LapTime(s)'].idxmin()
+        fastest_laps = laps_cleaned.loc[fastest_indices]
+
+        if not fastest_laps.empty:
+            fastest_laps = fastest_laps.rename(columns={'LapTime(s)': time_col_name})
+            # Wybierz tylko potrzebne kolumny i ustaw indeks
+            processed_df = fastest_laps.set_index('Driver')[[time_col_name]]
+            print(f"  [get_fastest] Znaleziono najszybsze czasy dla {len(processed_df)} kierowców.")
+            return processed_df
+        else:
+             print("  Ostrzeżenie [get_fastest]: Nie znaleziono najszybszych okrążeń po grupowaniu.")
+             return pd.DataFrame(columns=[time_col_name], index=pd.Index([], name='Driver'))
+
+    except KeyError as e:
+         print(f"  Błąd KeyError [get_fastest]: {e}. Sprawdź nazwy kolumn.")
+    except Exception as e:
+        print(f"  Niespodziewany błąd [get_fastest]: {e}")
+
+    return pd.DataFrame(columns=[time_col_name], index=pd.Index([], name='Driver'))
+
+def load_f1_session(year: int, gp: str, session_type: str) -> fastf1.core.Session | None:
+    """Pobiera i ładuje dane dla określonej sesji F1."""
+    print(f"\nŁadowanie danych dla: Rok={year}, GP='{gp}', Sesja='{session_type}'")
+    try:
+        session = fastf1.get_session(year, gp, session_type)
+        session.load(telemetry=False, weather=False, messages=False) # Optymalizacja - ładuj tylko potrzebne dane (laps, etc.)
+        print(f"-> Dane dla {session.event['EventName']} {year} - {session_type} załadowane.")
+        return session
+    except fastf1.ergast.ErgastConnectionError as e:
+         print(f"  Błąd połączenia z Ergast API: {e}")
+    except ValueError as e:
+        print(f"  Błąd: Nie znaleziono sesji {year}/{gp}/{session_type} lub problem z danymi - {e}")
+    except Exception as e:
+        print(f"  Niespodziewany błąd ładowania ({year}, {gp}, {session_type}): {e}")
+    return None
+
+# --- Główna Funkcja Wykonawcza ---
+
+def main():
+    """Główny przepływ przetwarzania danych i budowy modelu."""
+
+    # --- 1. Ładowanie Danych ---
+    print("-" * 30)
+    print("1. Ładowanie Danych")
+    print("-" * 30)
+
+    if not os.path.exists(CACHE_DIR):
+        try: os.makedirs(CACHE_DIR); print(f"Katalog cache '{CACHE_DIR}' utworzony.")
+        except OSError as e: print(f"Błąd tworzenia cache: {e}")
+    try: fastf1.Cache.enable_cache(CACHE_DIR); print(f"Cache FastF1 włączony: {CACHE_DIR}")
+    except Exception as e: print(f"Błąd włączania cache: {e}")
+
+    target_session = load_f1_session(TARGET_YEAR, TARGET_GP, TARGET_SESSION_TYPE)
+    source_session = load_f1_session(SOURCE_YEAR, SOURCE_GP, SOURCE_SESSION_TYPE)
+
+    if not target_session or not source_session:
+        print("\nBŁĄD KRYTYCZNY: Nie udało się załadować jednej z wymaganych sesji. Zakończenie.")
+        return
+
+    # --- 2. Preprocessing ---
+    print("\n" + "-" * 30)
+    print("2. Preprocessing Danych")
+    print("-" * 30)
+
+    X_train, y_train, X_predict, predict_drivers = None, None, None, None
+
+    laps_target_raw = target_session.laps if hasattr(target_session, 'laps') else None
+    laps_source_raw = source_session.laps if hasattr(source_session, 'laps') else None
+
+    # Przygotuj X (najlepszy czas z sesji źródłowej - Quali 2024)
+    fastest_source_times = get_fastest_lap_per_driver(laps_source_raw, FEATURE_COL_NAME)
+
+    # Przygotuj Y (wszystkie czasy z sesji docelowej - Race 2023)
+    all_target_laps = pd.DataFrame()
+    if laps_target_raw is not None and not laps_target_raw.empty and all(c in laps_target_raw.columns for c in ['Driver', 'LapTime']):
+        all_target_laps = laps_target_raw[['Driver', 'LapTime']].copy()
+        all_target_laps[TARGET_COL_NAME] = all_target_laps['LapTime'].apply(time_to_seconds)
+        all_target_laps.dropna(subset=[TARGET_COL_NAME, 'Driver'], inplace=True)
+        print(f"  [preprocess] Przetworzono {len(all_target_laps)} prawidłowych okrążeń docelowych (Y).")
+    else:
+        print("  Ostrzeżenie [preprocess]: Brak danych okrążeń docelowych (Y) lub wymaganych kolumn.")
+
+    # Połącz X i Y dla treningu
+    if not fastest_source_times.empty and not all_target_laps.empty:
+        fastest_source_times_reset = fastest_source_times.reset_index()
+        training_data_merged = pd.merge(
+            all_target_laps, fastest_source_times_reset, on='Driver', how='inner'
+        )
+        print(f"  [preprocess] Połączono dane treningowe: {len(training_data_merged)} wierszy dla {training_data_merged['Driver'].nunique()} kierowców.")
+
+        if not training_data_merged.empty:
+            X_train = training_data_merged[[FEATURE_COL_NAME]]
+            y_train = training_data_merged[TARGET_COL_NAME]
+            print(f"  [preprocess] Przygotowano X_train (shape: {X_train.shape}) i y_train (shape: {y_train.shape})")
+        else:
+            print("  [preprocess] Brak danych treningowych po połączeniu.")
+    else:
+        print("  [preprocess] Nie można połączyć danych - brak przetworzonych danych X lub Y.")
+
+    # Przygotuj X_predict (najlepsze czasy z sesji źródłowej)
+    if not fastest_source_times.empty:
+         # Usuń NaN z DataFrame (choć funkcja get_fastest... powinna to robić)
+        fastest_source_times.dropna(inplace=True)
+        if not fastest_source_times.empty:
+            X_predict = fastest_source_times[[FEATURE_COL_NAME]]
+            predict_drivers = fastest_source_times.index.tolist()
+            print(f"  [preprocess] Przygotowano X_predict (shape: {X_predict.shape}) dla {len(predict_drivers)} kierowców.")
+        else:
+            print("  [preprocess] Brak danych do predykcji po usunięciu NaN.")
+    else:
+        print("  [preprocess] Brak danych źródłowych do przygotowania X_predict.")
+
+    if X_train is None or y_train is None:
+        print("\nBŁĄD KRYTYCZNY: Nie udało się przygotować danych treningowych. Zakończenie.")
+        return
+    if X_predict is None or predict_drivers is None:
+        print("\nBŁĄD KRYTYCZNY: Nie udało się przygotować danych do predykcji. Zakończenie.")
+        return
+
+    # --- 3. Trening Modelu ---
+    print("\n" + "-" * 30)
+    print("3. Trening Modelu")
+    print("-" * 30)
+
+    model = None
+    mae_val = None
+
+    try:
+        # Podział na zbiór treningowy i walidacyjny
+        X_train_split, X_val, y_train_split, y_val = train_test_split(
+            X_train, y_train, test_size=TEST_SPLIT_SIZE, random_state=RANDOM_STATE_SPLIT
+        )
+        print(f"  Podzielono dane na trening ({len(X_train_split)}) i walidację ({len(X_val)}).")
+
+        # Definicja i trening modelu
+        model = GradientBoostingRegressor(
+            n_estimators=N_ESTIMATORS, learning_rate=LEARNING_RATE, random_state=RANDOM_STATE_MODEL
+        )
+        print("  Trenowanie modelu Gradient Boosting Regressor...")
+        model.fit(X_train_split, y_train_split)
+        print("  Trening zakończony.")
+
+        # Ocena na zbiorze walidacyjnym
+        y_pred_val = model.predict(X_val)
+        mae_val = mean_absolute_error(y_val, y_pred_val)
+        print(f"  Średni Błąd Bezwzględny (MAE) na walidacji: {mae_val:.4f} s")
+
+    except ValueError as e:
+         print(f"  Ostrzeżenie: Błąd podczas podziału danych ({e}). Trenowanie na wszystkich danych.")
+         try:
+            model = GradientBoostingRegressor(
+                n_estimators=N_ESTIMATORS, learning_rate=LEARNING_RATE, random_state=RANDOM_STATE_MODEL
+            )
+            model.fit(X_train, y_train)
+            print("  Trening zakończony (na wszystkich danych).")
+            mae_val = None # Brak oceny walidacyjnej
+         except Exception as train_e:
+             print(f"  Błąd podczas treningu na wszystkich danych: {train_e}")
+             model = None
+    except Exception as e:
+        print(f"  Niespodziewany błąd podczas treningu: {e}")
+        model = None
+
+    if model is None:
+        print("\nBŁĄD KRYTYCZNY: Nie udało się wytrenować modelu. Zakończenie.")
+        return
+
+    # --- 4. Predykcja ---
+    print("\n" + "-" * 30)
+    print("4. Predykcja Wyników")
+    print("-" * 30)
+
+    predicted_results_df = None
+
+    try:
+        print(f"Predykcja dla {len(X_predict)} kierowców...")
+        predicted_lap_times = model.predict(X_predict)
+
+        if len(predicted_lap_times) == len(predict_drivers):
+            results_data = {'Driver': predict_drivers, 'PredictedRaceTime(s)': predicted_lap_times}
+            predicted_results_df = pd.DataFrame(results_data)
+            predicted_results_df = predicted_results_df.sort_values(by='PredictedRaceTime(s)', ascending=True)
+            predicted_results_df = predicted_results_df.reset_index(drop=True)
+            predicted_results_df.index += 1
+            print("  Predykcja zakończona pomyślnie.")
+        else:
+            print(f"  Błąd: Niezgodność liczby wyników ({len(predicted_lap_times)}) i kierowców ({len(predict_drivers)}).")
+    except Exception as e:
+        print(f"  Niespodziewany błąd podczas predykcji: {e}")
+
+    if predicted_results_df is None:
+        print("\nBŁĄD KRYTYCZNY: Nie udało się przeprowadzić predykcji. Zakończenie.")
+        return
+
+    # --- 5. Prezentacja Wyników ---
+    print("\n" + "-" * 30)
+    print("5. Prezentacja Wyników")
+    print("-" * 30)
+
+    # Tabela
+    print(f"\n--- Przewidywane Wyniki (na podstawie Q {SOURCE_YEAR} vs R {TARGET_YEAR}) ---")
+    try:
+        pd.set_option('display.max_rows', len(predicted_results_df) + 1)
+        print(predicted_results_df.to_string())
+        pd.reset_option('display.max_rows')
+    except Exception as e: print(f"Błąd wyświetlania tabeli: {e}")
+
+    # Zwycięzca
+    if not predicted_results_df.empty:
+        winner = predicted_results_df.iloc[0]['Driver']
+        time = predicted_results_df.iloc[0]['PredictedRaceTime(s)']
+        print(f"\nModel wskazuje jako 'najszybszego': {winner} ({time:.4f} s)")
+
+    # MAE
+    if mae_val is not None:
+        print(f"\nInformacja o modelu: MAE (walidacja) = {mae_val:.4f} s (~{mae_val:.2f} s błędu)")
+    else:
+        print("\nInformacja o modelu: MAE na zbiorze walidacyjnym nieobliczone.")
+
+    # Wykres
+    print("\nGenerowanie wizualizacji...")
+    try:
+        top_n = 10
+        results_to_plot = predicted_results_df.head(top_n)
+        plt.figure(figsize=(12, 7))
+        # Poprawka dla FutureWarning - dodajemy hue
+        sns.barplot(x='PredictedRaceTime(s)', y='Driver', data=results_to_plot.iloc[::-1],
+                    palette='viridis', hue='Driver', legend=False)
+        plt.xlabel(f"Przewidywany 'Czas Okrążenia' (s) (Q{SOURCE_YEAR} vs R{TARGET_YEAR})")
+        plt.ylabel("Kierowca")
+        plt.title(f"Przewidywany Ranking TOP {top_n} - Model (Q{SOURCE_YEAR} vs R{TARGET_YEAR})")
+        plt.tight_layout()
+        plot_filename = f"predicted_ranking_EXP_{TARGET_YEAR}R_vs_{SOURCE_YEAR}Q.png"
+        plt.savefig(plot_filename)
+        print(f"Wizualizacja zapisana: {plot_filename}")
+        plt.show() # Może nie działać w niektórych środowiskach
+    except ImportError: print("  Ostrzeżenie: Brak matplotlib/seaborn. Zainstaluj: pip install matplotlib seaborn")
+    except Exception as e: print(f"  Błąd wizualizacji: {e}")
+
+# --- Uruchomienie Głównej Funkcji ---
+if __name__ == "__main__":
+    main()
+    print("\n--- Koniec działania skryptu ---")
+
+# --- END OF FILE app.py ---
