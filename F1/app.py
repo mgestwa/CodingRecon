@@ -234,6 +234,28 @@ def main():
     if X_predict is None or predict_drivers is None:
         print("\nBŁĄD KRYTYCZNY: Nie udało się przygotować danych do predykcji. Zakończenie.")
         return
+    
+    # --- PODGLĄD DANYCH --- #
+    print("\n=== Podgląd danych treningowych (training_data_merged) ===")
+    if 'training_data_merged' in locals() and training_data_merged is not None:
+        print(training_data_merged.head(10))   # pierwsze 10 wierszy do podglądu
+        print(f"Liczba wierszy: {len(training_data_merged)} | Liczba kierowców: {training_data_merged['Driver'].nunique()}")
+    else:
+        print("Brak danych treningowych.")
+
+    print("\n=== Podgląd X_train ===")
+    if X_train is not None:
+        print(X_train.head(10))
+
+    print("\n=== Podgląd y_train ===")
+    if y_train is not None:
+        print(y_train.head(10))
+
+    print("\n=== Podgląd danych do predykcji (X_predict) ===")
+    if X_predict is not None:
+        print(X_predict.head(10))
+
+    
 
     # --- 3. Trening Modelu ---
     print("\n" + "-" * 30)
